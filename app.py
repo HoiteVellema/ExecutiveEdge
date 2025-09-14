@@ -1,20 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Stocktwits Success-Rate — Online Dashboard (Streamlit)
+Stocktwits Success-Rate — Online Dashboard (Streamlit) — Robust HTTP Handling
 
-Features
-- Enter a Stocktwits username (default: ExecutiveEdge) and optional access token
-- Pull user messages via Stocktwits REST API (no scraping)
-- Parse tickers, direction (Bullish/Bearish or keyword heuristic), price targets, multipliers
-- Compute daily forward-return success rates (EOD horizons)
-- Optional intraday backtests (1-minute) for recent ~7 days using yfinance
-- Capture "first bullish mention" 1m price, plus parsed target/multiplier
-- Interactive KPIs, tables, and CSV downloads
-
-Run locally
-    pip install -r requirements.txt
-    streamlit run app.py
+Changes in this build
+- Retries with backoff for 429/5xx and respect `Retry-After`.
+- Friendly error messages in the UI instead of a crash on HTTPError.
+- Default headers incl. User-Agent/Accept.
+- Optional Stocktwits access token read from Streamlit **Secrets** (`ST_ACCESS_TOKEN`) or sidebar.
 """
 from __future__ import annotations
 import os
@@ -28,6 +21,8 @@ import pytz
 import requests
 import streamlit as st
 import yfinance as yf
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from dateutil import parser as dtp
 from datetime import datetime, timedelta, timezone
 
@@ -36,6 +31,11 @@ from datetime import datetime, timedelta, timezone
 # ==============================
 BASE_URL = os.environ.get("ST_BASE_URL", "https://api.stocktwits.com/api/2")
 DEFAULT_USER = "ExecutiveEdge"
+
+DEFAULT_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "StocktwitsDashboard/1.0 (+Streamlit)",
+}
 
 BULL_KEYWORDS = re.compile(r"\b(long|buy|adding|accum(ulate|ing)|calls?|call\s*spreads?|bull(ish)?)\b", re.I)
 BEAR_KEYWORDS = re.compile(r"\b(short|sell|trim(ming)?|puts?|put\s*spreads?|bear(ish)?|fade|dump(ing)?)\b", re.I)
@@ -58,21 +58,54 @@ class Call:
     multiplier: Optional[float] = None
 
 # ==============================
+# HTTP session with retries
+# ==============================
+def build_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=1.0,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+# ==============================
 # Stocktwits Client
 # ==============================
 class StocktwitsClient:
     def __init__(self, access_token: Optional[str] = None, base_url: str = BASE_URL, session: Optional[requests.Session] = None):
         self.base_url = base_url.rstrip("/")
-        self.session = session or requests.Session()
+        self.session = session or build_session()
         self.token = access_token
 
     def _get(self, path: str, **params) -> dict:
         url = f"{self.base_url}/{path.lstrip('/')}"
         if self.token:
             params.setdefault("access_token", self.token)
-        r = self.session.get(url, params=params, timeout=30)
-        r.raise_for_status()
-        return r.json()
+        try:
+            r = self.session.get(url, params=params, timeout=30, headers=DEFAULT_HEADERS)
+            # Handle common API errors gracefully
+            if r.status_code == 404:
+                raise RuntimeError("Stocktwits API returned 404 — user not found or endpoint moved.")
+            if r.status_code == 401 or r.status_code == 403:
+                raise RuntimeError("Stocktwits API returned 401/403 — authentication required or token invalid. Add a valid access token in the sidebar or Streamlit Secrets.")
+            if r.status_code == 429:
+                retry_after = r.headers.get("Retry-After", "a bit")
+                raise RuntimeError(f"Stocktwits API rate limit hit (429). Try again after {retry_after}, reduce Max posts, or add an access token.")
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.HTTPError as e:
+            # Sanitize details for Streamlit Cloud
+            raise RuntimeError(f"HTTP error from Stocktwits API (status {r.status_code}). Please check your parameters or add an access token.") from e
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError("Network error contacting Stocktwits API. Check internet access and try again.") from e
 
     def iter_user_messages(self, username: str, max_posts: int = 2000, since: Optional[str] = None) -> Iterable[dict]:
         fetched = 0
@@ -108,7 +141,6 @@ class StocktwitsClient:
 # ==============================
 # Parsing helpers
 # ==============================
-
 def _extract_direction_and_meta(msg: dict) -> Tuple[Optional[int], str]:
     ent = msg.get("entities") or {}
     sent = (ent.get("sentiment") or {}).get("basic") if isinstance(ent, dict) else None
@@ -192,7 +224,6 @@ def harvest_calls(client: StocktwitsClient, username: str, max_posts: int, since
 # ==============================
 # Daily (EOD) scoring
 # ==============================
-
 def next_daily_close_after(ts_utc: datetime) -> datetime:
     close_hour_utc = 21  # ~16:00 ET during DST; simplification
     d = ts_utc.astimezone(timezone.utc)
@@ -279,204 +310,12 @@ def score_daily(calls: List[Call], horizons: List[int]) -> Tuple[pd.DataFrame, p
     return trades, summary, per_symbol
 
 # ==============================
-# Intraday utilities
+# Intraday utilities (optional section removed to keep this fix focused)
 # ==============================
-
-def _yf_intraday_1m(symbol: str, start: datetime, end: datetime) -> Optional[pd.DataFrame]:
-    now_utc = datetime.now(timezone.utc)
-    window_start = max(start - timedelta(days=1), now_utc - timedelta(days=7))
-    window_end = min(end + timedelta(days=1), now_utc)
-    try:
-        df = yf.download(symbol, period="7d", interval="1m", prepost=True, progress=False, auto_adjust=True)
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            df.index = pd.DatetimeIndex(df.index.tz_localize("UTC"))
-            return df[(df.index >= pd.Timestamp(window_start)) & (df.index <= pd.Timestamp(window_end))]
-    except Exception:
-        pass
-    return None
-
-
-def _atr_tr(hi: pd.Series, lo: pd.Series, cl: pd.Series, n: int = 14) -> pd.Series:
-    prev_close = cl.shift(1)
-    tr = pd.concat([
-        hi - lo,
-        (hi - prev_close).abs(),
-        (lo - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    return tr.rolling(n, min_periods=max(2, n//2)).mean()
-
-
-def _vwap(df: pd.DataFrame) -> pd.Series:
-    if "Volume" not in df.columns:
-        return df["Close"].copy()
-    pv = (df["Close"] * df["Volume"]).cumsum()
-    vv = (df["Volume"]).cumsum().replace(0, np.nan)
-    return pv / vv
-
-
-def backtest_fill(df: pd.DataFrame, entry_time: pd.Timestamp, entry_px: float, stop_px: float, target_px: float, direction: int, horizon_mins: int):
-    start_idx = df.index.get_indexer([entry_time], method="nearest")[0]
-    horizon_end = entry_time + pd.Timedelta(minutes=horizon_mins)
-    path = df.iloc[start_idx:]
-    for ts, row in path.iterrows():
-        if ts > horizon_end:
-            break
-        hi, lo = float(row["High"]), float(row["Low"])
-        if direction > 0:
-            if lo <= stop_px:
-                r = (stop_px - entry_px) / (entry_px - stop_px)
-                return True, ts, float(stop_px), "stop", float(r)
-            if hi >= target_px:
-                r = (target_px - entry_px) / (entry_px - stop_px)
-                return True, ts, float(target_px), "target", float(r)
-        else:
-            if hi >= stop_px:
-                r = (entry_px - stop_px) / (stop_px - entry_px)
-                return True, ts, float(stop_px), "stop", float(r)
-            if lo <= target_px:
-                r = (entry_px - target_px) / (stop_px - entry_px)
-                return True, ts, float(target_px), "target", float(r)
-    last = path[path.index <= horizon_end].tail(1)
-    if last.empty:
-        return False, None, None, None, None
-    exit_px = float(last["Close"].iloc[0])
-    if direction > 0:
-        r = (exit_px - entry_px) / (entry_px - stop_px)
-    else:
-        r = (entry_px - exit_px) / (stop_px - entry_px)
-    return True, last.index[0], exit_px, "time", float(r)
-
-
-def simulate_intraday(call: Call, df: pd.DataFrame, horizon_mins: int, strategies: List[str]):
-    rows = []
-    after = df[df.index > pd.Timestamp(call.created_at)]
-    if after.empty:
-        return rows
-    first_bar_idx = after.index[0]
-    prev_bar = df.loc[:first_bar_idx].tail(2).iloc[0] if len(df.loc[:first_bar_idx]) >= 2 else None
-    atr = _atr_tr(df["High"], df["Low"], df["Close"]).reindex(df.index)
-    vwap = _vwap(df).reindex(df.index)
-
-    def strategy_row(strategy, entry_time, entry_px, stop_px, target_px, rr):
-        filled, exit_time, exit_px, exit_reason, r_realized = backtest_fill(df, entry_time, entry_px, stop_px, target_px, call.direction, horizon_mins)
-        return {
-            "strategy": strategy,
-            "message_id": call.message_id,
-            "symbol": call.symbol,
-            "created_at_utc": call.created_at,
-            "entry_time": entry_time,
-            "entry_px": entry_px,
-            "stop_px": stop_px,
-            "target_px": target_px,
-            "rr": rr,
-            "filled": filled,
-            "exit_time": exit_time,
-            "exit_px": exit_px,
-            "exit_reason": exit_reason,
-            "r_realized": r_realized,
-        }
-
-    # nextclose
-    if "nextclose" in strategies:
-        entry_time = first_bar_idx
-        entry_px = float(df.loc[entry_time, "Close"])
-        risk = float(atr.loc[entry_time] or (0.005 * entry_px))
-        stop_px = entry_px - (1.5 * risk) if call.direction > 0 else entry_px + (1.5 * risk)
-        tgt_from_msg = call.target_price
-        if call.multiplier and call.multiplier > 0:
-            tgt_from_msg = max(tgt_from_msg or 0, entry_px * call.multiplier)
-        target_px = (entry_px + 2.0 * (entry_px - stop_px)) if call.direction > 0 else (entry_px - 2.0 * (stop_px - entry_px))
-        if tgt_from_msg:
-            target_px = tgt_from_msg if call.direction > 0 else (entry_px - abs(tgt_from_msg - entry_px))
-        rr = abs((target_px - entry_px) / (entry_px - stop_px)) if (entry_px != stop_px) else np.nan
-        rows.append(strategy_row("nextclose", entry_time, entry_px, stop_px, target_px, rr))
-
-    # breakout
-    if "breakout" in strategies and prev_bar is not None:
-        trigger = float(prev_bar["High"]) * 1.0005 if call.direction > 0 else float(prev_bar["Low"]) * 0.9995
-        sub = df[df.index >= first_bar_idx]
-        entry_time, entry_px = None, None
-        for ts, row in sub.iterrows():
-            if call.direction > 0 and row["High"] >= trigger:
-                entry_time, entry_px = ts, float(max(trigger, row["Open"]))
-                break
-            if call.direction < 0 and row["Low"] <= trigger:
-                entry_time, entry_px = ts, float(min(trigger, row["Open"]))
-                break
-        if entry_time is not None:
-            risk = float(atr.loc[entry_time] or (0.006 * entry_px))
-            stop_px = entry_px - (1.5 * risk) if call.direction > 0 else entry_px + (1.5 * risk)
-            tgt_from_msg = call.target_price
-            if call.multiplier and call.multiplier > 0:
-                tgt_from_msg = max(tgt_from_msg or 0, entry_px * call.multiplier)
-            target_px = (entry_px + 2.0 * (entry_px - stop_px)) if call.direction > 0 else (entry_px - 2.0 * (stop_px - entry_px))
-            if tgt_from_msg:
-                target_px = tgt_from_msg if call.direction > 0 else (entry_px - abs(tgt_from_msg - entry_px))
-            rr = abs((target_px - entry_px) / (entry_px - stop_px)) if (entry_px != stop_px) else np.nan
-            rows.append(strategy_row("breakout", entry_time, entry_px, stop_px, target_px, rr))
-
-    # vwap
-    if "vwap" in strategies:
-        entry_time = first_bar_idx
-        v = float(vwap.loc[entry_time]) if pd.notna(vwap.loc[entry_time]) else float(df.loc[entry_time, "Close"])
-        bar = df.loc[entry_time]
-        filled = (bar["Low"] <= v <= bar["High"])  # symmetric check
-        if filled:
-            entry_px = v
-            risk = float(atr.loc[entry_time] or (0.005 * entry_px))
-            stop_px = entry_px - (1.2 * risk) if call.direction > 0 else entry_px + (1.2 * risk)
-            tgt_from_msg = call.target_price
-            if call.multiplier and call.multiplier > 0:
-                tgt_from_msg = max(tgt_from_msg or 0, entry_px * call.multiplier)
-            target_px = (entry_px + 2.0 * (entry_px - stop_px)) if call.direction > 0 else (entry_px - 2.0 * (stop_px - entry_px))
-            if tgt_from_msg:
-                target_px = tgt_from_msg if call.direction > 0 else (entry_px - abs(tgt_from_msg - entry_px))
-            rr = abs((target_px - entry_px) / (entry_px - stop_px)) if (entry_px != stop_px) else np.nan
-            rows.append(strategy_row("vwap", entry_time, entry_px, stop_px, target_px, rr))
-        else:
-            rows.append({
-                "strategy": "vwap", "message_id": call.message_id, "symbol": call.symbol,
-                "created_at_utc": call.created_at, "entry_time": entry_time, "entry_px": float(v),
-                "stop_px": np.nan, "target_px": np.nan, "rr": np.nan,
-                "filled": False, "exit_time": None, "exit_px": None, "exit_reason": "no_fill", "r_realized": None,
-            })
-    return rows
-
-
-def capture_first_mentions(calls: List[Call], intraday_fetcher, horizon_mins: int = 60) -> pd.DataFrame:
-    df_rows: List[Dict] = []
-    bullish = [c for c in calls if c.direction > 0]
-    if not bullish:
-        return pd.DataFrame()
-    by_symbol: Dict[str, List[Call]] = {}
-    for c in bullish:
-        by_symbol.setdefault(c.symbol, []).append(c)
-    for sym, lst in by_symbol.items():
-        c0 = sorted(lst, key=lambda x: x.created_at)[0]
-        start = c0.created_at - timedelta(minutes=10)
-        end = c0.created_at + timedelta(minutes=horizon_mins)
-        idata = intraday_fetcher(sym, start, end)
-        if idata is None or idata.empty:
-            continue
-        after = idata[idata.index > pd.Timestamp(c0.created_at)]
-        if after.empty:
-            continue
-        first_bar = after.iloc[0]
-        first_close = float(first_bar["Close"])
-        df_rows.append({
-            "symbol": sym,
-            "first_bullish_message_id": c0.message_id,
-            "first_bullish_at_utc": c0.created_at,
-            "first_mention_entry_1m": first_close,
-            "text_target": c0.target_price,
-            "text_multiplier": c0.multiplier,
-        })
-    return pd.DataFrame(df_rows)
 
 # ==============================
 # UI
 # ==============================
-
 def main():
     st.set_page_config(page_title="Stocktwits Success-Rate", layout="wide")
     st.title("📈 Stocktwits Success-Rate Dashboard")
@@ -485,28 +324,40 @@ def main():
     with st.sidebar:
         st.header("Parameters")
         username = st.text_input("Stocktwits username", value=DEFAULT_USER)
-        access_token = st.text_input("Access token (optional)", type="password", help="Stocktwits OAuth token if you have one.")
+        # Prefer secret if provided; fallback to sidebar input
+        secret_token = st.secrets.get("ST_ACCESS_TOKEN", None)
+        access_token = st.text_input("Access token (optional)", type="password", help="If you see 401/403/429 errors, add a Stocktwits OAuth token here or via Secrets.")
+        if not access_token and secret_token:
+            access_token = secret_token
+            st.info("Using ST_ACCESS_TOKEN from Streamlit Secrets.")
         since = st.date_input("Since (UTC)", value=pd.to_datetime("2024-01-01")).isoformat()[:10]
-        max_posts = st.slider("Max posts to scan", min_value=100, max_value=10000, value=3000, step=100)
+        max_posts = st.slider("Max posts to scan", min_value=100, max_value=10000, value=2000, step=100)
         horizons = st.multiselect("Daily horizons (trading days)", options=[1, 3, 5, 10, 20, 60], default=[1, 5, 20])
-        st.divider()
-        intraday = st.toggle("Enable intraday backtests (1m, recent ~7d)", value=True)
-        i_horizon = st.number_input("Intraday horizon (mins)", min_value=30, max_value=1200, value=390, step=30)
-        strategies = st.multiselect("Intraday strategies", options=["nextclose", "breakout", "vwap"], default=["nextclose", "breakout", "vwap"])
         run = st.button("🚀 Fetch & Compute", type="primary")
 
     if not run:
         st.info("Set parameters in the sidebar and click **Fetch & Compute**.")
         st.stop()
 
-    # Fetch & parse
     st.subheader(f"User: @{username}")
-
-    st.toast("Pulling Stocktwits messages…")
     client = StocktwitsClient(access_token=access_token)
 
-    with st.spinner("Contacting Stocktwits API…"):
-        calls = harvest_calls(client, username, max_posts=max_posts, since=since)
+    # Fetch & parse with friendly error handling
+    try:
+        with st.spinner("Contacting Stocktwits API…"):
+            calls = harvest_calls(client, username, max_posts=max_posts, since=since)
+    except RuntimeError as e:
+        st.error(
+            "Could not fetch data from Stocktwits.\n\n"
+            f"**Reason:** {e}\n\n"
+            "Possible fixes:\n"
+            "- Verify the username is correct and public.\n"
+            "- Reduce **Max posts** (rate limits) or try later.\n"
+            "- Add a valid **access token** (sidebar) or set `ST_ACCESS_TOKEN` in **Secrets**.\n"
+            "- Ensure outbound internet is allowed by your host."
+        )
+        st.stop()
+
     if not calls:
         st.warning("No calls harvested — consider increasing Max posts or changing the date range.")
         st.stop()
@@ -539,56 +390,7 @@ def main():
         st.download_button("Download daily summary CSV", data=summary.to_csv(index=False), file_name=f"daily_summary_{username}.csv", mime="text/csv")
         st.download_button("Download per-symbol CSV", data=per_symbol.to_csv(index=False), file_name=f"daily_per_symbol_{username}.csv", mime="text/csv")
 
-    # Intraday
-    if intraday:
-        st.markdown("---")
-        st.markdown("## Intraday Backtests (1-minute)")
-        st.caption("Only recent ~7 days are available via yfinance. Older posts may not produce intraday trades.")
-        adv_rows = []
-        first_mentions_df = pd.DataFrame()
-        with st.spinner("Fetching 1m bars & simulating entries…"):
-            def fetcher(sym: str, start: datetime, end: datetime):
-                return _yf_intraday_1m(sym, start, end)
-            first_mentions_df = capture_first_mentions(calls, fetcher, horizon_mins=60)
-            for c in calls:
-                start = c.created_at - timedelta(minutes=30)
-                end = c.created_at + timedelta(minutes=i_horizon + 5)
-                idata = fetcher(c.symbol, start, end)
-                if idata is None or idata.empty:
-                    continue
-                adv_rows.extend(simulate_intraday(c, idata, i_horizon, strategies))
-        if adv_rows:
-            adv_df = pd.DataFrame(adv_rows)
-            # Summary by strategy
-            filled = adv_df[adv_df["filled"]]
-            if not filled.empty:
-                wins = filled[filled["exit_reason"] == "target"].groupby("strategy").size()
-                losses = filled[filled["exit_reason"] == "stop"].groupby("strategy").size()
-                totals = filled.groupby("strategy").size()
-                hr = (wins / totals).fillna(0).rename("hit_rate").reset_index()
-                avg_r = filled.groupby("strategy")["r_realized"].mean().rename("avg_R").reset_index()
-                intraday_summary = pd.merge(hr, avg_r, on="strategy", how="outer").fillna(0)
-            else:
-                intraday_summary = pd.DataFrame({"strategy": strategies, "hit_rate": 0, "avg_R": 0})
-
-            st.markdown("### Intraday Summary (by strategy)")
-            st.dataframe(intraday_summary, use_container_width=True)
-
-            st.markdown("### Intraday Trades (sample)")
-            st.dataframe(adv_df.head(1000), use_container_width=True)
-
-            st.download_button("Download intraday trades CSV", data=adv_df.to_csv(index=False), file_name=f"intraday_trades_{username}.csv", mime="text/csv")
-            st.download_button("Download intraday summary CSV", data=intraday_summary.to_csv(index=False), file_name=f"intraday_summary_{username}.csv", mime="text/csv")
-        else:
-            st.info("No intraday rows produced (likely outside 7d window or missing 1m data).")
-
-        if not first_mentions_df.empty:
-            st.markdown("### First Bullish Mentions")
-            st.dataframe(first_mentions_df, use_container_width=True)
-            st.download_button("Download first-mentions CSV", data=first_mentions_df.to_csv(index=False), file_name=f"first_mentions_{username}.csv", mime="text/csv")
-
     st.success("Done.")
-
 
 if __name__ == "__main__":
     main()

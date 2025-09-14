@@ -5,3 +5,4 @@ numpy
 pytz
 python-dateutil
 yfinance
+urllib3>=1.26
